@@ -31,8 +31,7 @@ async function extractPages(docId) {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process'
+            '--disable-blink-features=AutomationControlled'
         ]
     });
     
@@ -44,40 +43,25 @@ async function extractPages(docId) {
         
         await page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             window.chrome = { runtime: {} };
         });
         
-        // Try embed URL first (lighter weight)
+        // Go to embed URL
         const embedUrl = `https://www.scribd.com/embeds/${docId}/content`;
         console.log(`[NAV] Going to: ${embedUrl}`);
         
-        try {
-            await page.goto(embedUrl, { 
-                waitUntil: 'domcontentloaded',
-                timeout: 30000
-            });
-            console.log(`[NAV] Embed loaded`);
-        } catch (e) {
-            console.log(`[NAV] Embed failed: ${e.message}`);
-            // Try document page
-            try {
-                await page.goto(`https://www.scribd.com/document/${docId}`, { 
-                    waitUntil: 'domcontentloaded',
-                    timeout: 30000
-                });
-                console.log(`[NAV] Document page loaded`);
-            } catch (e2) {
-                throw new Error(`Failed to load page: ${e2.message}`);
-            }
-        }
+        await page.goto(embedUrl, { 
+            waitUntil: 'networkidle2',
+            timeout: 45000
+        });
         
-        // Wait for initial content
-        await new Promise(r => setTimeout(r, 3000));
+        console.log(`[NAV] Page loaded`);
         
-        // Get page info and images
-        const pageInfo = await page.evaluate(() => {
+        // Wait for content
+        await new Promise(r => setTimeout(r, 5000));
+        
+        // Extract ALL data from page
+        const pageData = await page.evaluate(() => {
             const html = document.body.innerHTML;
             const text = document.body.innerText;
             
@@ -97,166 +81,167 @@ async function extractPages(docId) {
                 if (m) { pageCount = parseInt(m[1]); break; }
             }
             
-            // Find all image URLs with page hashes
-            const images = [];
-            const imgPattern = /https?:\/\/html\.scribdassets\.com\/([^\/\s]+)\/images\/(\d+)-([a-f0-9]+)\.png/gi;
+            // Find ALL page hashes - try multiple methods
+            const pages = [];
+            const foundHashes = new Set();
+            
+            // Method 1: Image URLs in HTML
+            const imgPattern = /\/images\/(\d+)-([a-f0-9]+)\.png/gi;
             let match;
             while ((match = imgPattern.exec(html)) !== null) {
-                images.push({
-                    assetId: match[1],
-                    page: parseInt(match[2]),
-                    hash: match[3],
-                    url: match[0]
-                });
+                const pageNum = parseInt(match[1]);
+                if (!foundHashes.has(pageNum)) {
+                    foundHashes.add(pageNum);
+                    pages.push({ page: pageNum, hash: match[2] });
+                }
             }
             
-            // Also check img tags
+            // Method 2: Look in img tags
             document.querySelectorAll('img').forEach(img => {
-                const src = img.src || '';
-                const m = src.match(/\/images\/(\d+)-([a-f0-9]+)\.png/i);
-                if (m && !images.find(i => i.page === parseInt(m[1]))) {
-                    images.push({
-                        assetId: assetId,
-                        page: parseInt(m[1]),
-                        hash: m[2],
-                        url: src.split('?')[0]
+                const src = img.src || img.dataset?.src || '';
+                const m = src.match(/\/images\/(\d+)-([a-f0-9]+)\./i);
+                if (m && !foundHashes.has(parseInt(m[1]))) {
+                    foundHashes.add(parseInt(m[1]));
+                    pages.push({ page: parseInt(m[1]), hash: m[2] });
+                }
+            });
+            
+            // Method 3: Look for page data in JavaScript objects
+            // Scribd stores page data in various places
+            const scripts = document.querySelectorAll('script');
+            scripts.forEach(script => {
+                const content = script.textContent || '';
+                
+                // Pattern: "1":{"hash":"xxx"} or page: {hash: "xxx"}
+                const hashPatterns = [
+                    /"(\d+)":\s*\{[^}]*"hash":\s*"([a-f0-9]+)"/g,
+                    /"pages"\s*:\s*\{[^}]*"(\d+)":\s*\{[^}]*"hash":\s*"([a-f0-9]+)"/g,
+                    /\\"page\\":\s*(\d+),\s*\\"hash\\":\s*\\"([a-f0-9]+)\\"/g
+                ];
+                
+                for (const pattern of hashPatterns) {
+                    let m;
+                    while ((m = pattern.exec(content)) !== null) {
+                        const pageNum = parseInt(m[1]);
+                        if (!foundHashes.has(pageNum) && m[2].length >= 8) {
+                            foundHashes.add(pageNum);
+                            pages.push({ page: pageNum, hash: m[2] });
+                        }
+                    }
+                }
+            });
+            
+            // Method 4: Check window object for page data
+            if (window.__INITIAL_STATE__ || window.__PRELOADED_STATE__ || window.pageData) {
+                const state = window.__INITIAL_STATE__ || window.__PRELOADED_STATE__ || window.pageData;
+                if (state && state.pages) {
+                    Object.keys(state.pages).forEach(key => {
+                        const p = state.pages[key];
+                        if (p.hash && !foundHashes.has(parseInt(key))) {
+                            foundHashes.add(parseInt(key));
+                            pages.push({ page: parseInt(key), hash: p.hash });
+                        }
                     });
                 }
+            }
+            
+            // Method 5: Look for JSON in data attributes
+            document.querySelectorAll('[data-pages], [data-page-data]').forEach(el => {
+                try {
+                    const data = JSON.parse(el.dataset.pages || el.dataset.pageData || '{}');
+                    Object.keys(data).forEach(key => {
+                        const p = data[key];
+                        if (p.hash && !foundHashes.has(parseInt(key))) {
+                            foundHashes.add(parseInt(key));
+                            pages.push({ page: parseInt(key), hash: p.hash });
+                        }
+                    });
+                } catch (e) {}
             });
             
             return {
                 title: document.title,
                 assetId,
                 pageCount,
-                images,
-                url: window.location.href
+                pages,
+                debug: {
+                    htmlLength: html.length,
+                    scriptCount: scripts.length,
+                    imageCount: document.querySelectorAll('img').length
+                }
             };
         });
         
-        console.log(`[INFO] Title: ${pageInfo.title}, Asset: ${pageInfo.assetId}, Pages: ${pageInfo.pageCount}, Images: ${pageInfo.images.length}`);
+        console.log(`[DATA] Found ${pageData.pages.length} pages, asset: ${pageData.assetId}, total: ${pageData.pageCount}`);
+        console.log(`[DEBUG] HTML length: ${pageData.debug.htmlLength}, scripts: ${pageData.debug.scriptCount}`);
         
-        // Collect all pages
+        // If we found pages, construct URLs
         const allPages = new Map();
-        pageInfo.images.forEach(img => {
-            allPages.set(img.page, { page: img.page, hash: img.hash, url: img.url });
-        });
+        if (pageData.assetId) {
+            pageData.pages.forEach(p => {
+                allPages.set(p.page, {
+                    page: p.page,
+                    hash: p.hash,
+                    url: `https://html.scribdassets.com/${pageData.assetId}/images/${p.page}-${p.hash}.png`
+                });
+            });
+        }
         
-        // If we have assetId but few pages, try to scroll and load more
-        if (pageInfo.assetId && allPages.size < pageInfo.pageCount) {
-            console.log(`[SCROLL] Starting scroll to load more pages...`);
+        // If we still don't have enough pages, try scrolling
+        if (allPages.size < pageData.pageCount && pageData.assetId) {
+            console.log(`[SCROLL] Attempting to load more pages...`);
             
             let scrollAttempts = 0;
-            const maxScrolls = 100;
+            const maxScrolls = 80;
             
-            while (scrollAttempts < maxScrolls && allPages.size < pageInfo.pageCount) {
-                // Scroll down
+            while (scrollAttempts < maxScrolls && allPages.size < pageData.pageCount) {
                 await page.evaluate(() => {
-                    const scrollHeight = document.documentElement.scrollHeight;
-                    const currentScroll = window.scrollY;
-                    window.scrollTo(0, currentScroll + 600);
+                    window.scrollBy(0, 600);
                 });
                 
-                await new Promise(r => setTimeout(r, 400));
+                await new Promise(r => setTimeout(r, 300));
                 
                 // Check for new images
                 const newImages = await page.evaluate(() => {
                     const found = [];
                     document.querySelectorAll('img').forEach(img => {
                         const src = img.src || '';
-                        const match = src.match(/\/images\/(\d+)-([a-f0-9]+)\.png/i);
-                        if (match) {
-                            found.push({
-                                page: parseInt(match[1]),
-                                hash: match[2],
-                                url: src.split('?')[0]
-                            });
+                        const m = src.match(/\/images\/(\d+)-([a-f0-9]+)\./i);
+                        if (m) {
+                            found.push({ page: parseInt(m[1]), hash: m[2] });
                         }
                     });
-                    
-                    // Also check background images
-                    document.querySelectorAll('[style*="background"]').forEach(el => {
-                        const style = el.getAttribute('style') || '';
-                        const match = style.match(/url\(['"]*(\/[^'")]+\/images\/(\d+)-([a-f0-9]+)\.png)['"]*\)/i);
-                        if (match) {
-                            found.push({
-                                page: parseInt(match[2]),
-                                hash: match[3],
-                                url: match[1]
-                            });
-                        }
-                    });
-                    
                     return found;
                 });
                 
-                newImages.forEach(img => {
-                    if (!allPages.has(img.page)) {
-                        allPages.set(img.page, img);
+                newImages.forEach(p => {
+                    if (!allPages.has(p.page)) {
+                        allPages.set(p.page, {
+                            page: p.page,
+                            hash: p.hash,
+                            url: `https://html.scribdassets.com/${pageData.assetId}/images/${p.page}-${p.hash}.png`
+                        });
                     }
                 });
                 
                 scrollAttempts++;
-                
-                if (scrollAttempts % 20 === 0) {
-                    console.log(`[SCROLL] Attempt ${scrollAttempts}, found ${allPages.size} pages`);
-                }
             }
-        }
-        
-        // If still no pages, try to get page data from scripts
-        if (allPages.size === 0 && pageInfo.assetId) {
-            console.log(`[SCRIPT] Looking for page data in scripts...`);
             
-            const scriptData = await page.evaluate(() => {
-                const results = [];
-                document.querySelectorAll('script').forEach(script => {
-                    const content = script.textContent || '';
-                    // Look for page arrays
-                    const pageMatches = content.matchAll(/"(\d+)":\s*\{[^}]*"hash":\s*"([a-f0-9]+)"/g);
-                    for (const match of pageMatches) {
-                        results.push({ page: parseInt(match[1]), hash: match[2] });
-                    }
-                });
-                return results;
-            });
-            
-            scriptData.forEach(p => {
-                if (!allPages.has(p.page)) {
-                    allPages.set(p.page, {
-                        page: p.page,
-                        hash: p.hash,
-                        url: `https://html.scribdassets.com/${pageInfo.assetId}/images/${p.page}-${p.hash}.png`
-                    });
-                }
-            });
+            console.log(`[SCROLL] Found ${allPages.size} pages after scrolling`);
         }
         
         const pagesArray = Array.from(allPages.values()).sort((a, b) => a.page - b.page);
         
-        console.log(`[DONE] Found ${pagesArray.length} pages`);
-        
-        // If we have asset ID but no pages found, construct at least page 1
-        if (pagesArray.length === 0 && pageInfo.assetId) {
-            // Return just the asset info so user can try manually
-            return {
-                success: false,
-                doc_id: docId,
-                asset_id: pageInfo.assetId,
-                title: pageInfo.title.replace(/\s*\|\s*Scribd\s*$/i, '').trim(),
-                page_count: pageInfo.pageCount,
-                pages: [],
-                error: 'Could not extract pages. Document may require login or is protected.',
-                debug: { assetId: pageInfo.assetId, pageCount: pageInfo.pageCount }
-            };
-        }
+        console.log(`[DONE] Total pages found: ${pagesArray.length}`);
         
         return {
             success: true,
             doc_id: docId,
-            asset_id: pageInfo.assetId,
-            title: pageInfo.title.replace(/\s*\|\s*Scribd\s*$/i, '').trim(),
-            page_count: Math.max(pageInfo.pageCount, pagesArray.length),
-            pages: pagesArray
+            asset_id: pageData.assetId,
+            title: pageData.title.replace(/\s*\|\s*Scribd\s*$/i, '').trim(),
+            page_count: Math.max(pageData.pageCount, pagesArray.length),
+            pages: pagesArray,
+            debug: pageData.debug
         };
         
     } catch (e) {
@@ -276,7 +261,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         service: 'scribd-extractor',
-        version: '2.1.0',
+        version: '2.2.0',
         engine: 'Node.js + Puppeteer'
     });
 });
@@ -296,24 +281,4 @@ app.get('/extract', async (req, res) => {
     }
 });
 
-app.post('/extract', async (req, res) => {
-    const { url, save } = req.body;
-    const docId = extractDocId(url);
-    if (!docId) return res.status(400).json({ success: false, error: 'invalid_url' });
-    
-    try {
-        const result = await extractPages(docId);
-        if (save && result.success && result.pages.length > 0) {
-            await fetch(`${WORKER_API}/api/cache`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(result)
-            });
-        }
-        res.json(result);
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-app.listen(PORT, () => console.log(`🚀 Scribd Extractor v2.1 on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Scribd Extractor v2.2 on port ${PORT}`));
