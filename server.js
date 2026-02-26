@@ -60,7 +60,20 @@ async function extractPages(docId) {
         // Wait for content
         await new Promise(r => setTimeout(r, 5000));
         
-        // Extract ALL data from page
+        // Scroll to bottom to trigger all lazy loading
+        console.log(`[SCROLL] Scrolling to load all pages...`);
+        
+        for (let i = 0; i < 100; i++) {
+            await page.evaluate(() => {
+                window.scrollBy(0, 700);
+            });
+            await new Promise(r => setTimeout(r, 200));
+        }
+        
+        // Wait after scrolling
+        await new Promise(r => setTimeout(r, 3000));
+        
+        // Extract ALL page hashes from the page
         const pageData = await page.evaluate(() => {
             const html = document.body.innerHTML;
             const text = document.body.innerText;
@@ -71,92 +84,102 @@ async function extractPages(docId) {
             
             // Get page count
             let pageCount = 0;
-            const countPatterns = [
-                /(\d+)\s*pages?/i,
-                /"total_pages"\s*:\s*(\d+)/,
-                /"page_count"\s*:\s*(\d+)/
-            ];
-            for (const p of countPatterns) {
-                const m = text.match(p) || html.match(p);
-                if (m) { pageCount = parseInt(m[1]); break; }
-            }
+            const countMatch = text.match(/(\d+)\s*pages?/i) || html.match(/"total_pages"\s*:\s*(\d+)/);
+            if (countMatch) pageCount = parseInt(countMatch[1]);
             
-            // Find ALL page hashes - try multiple methods
+            // Collect all page hashes
             const pages = [];
-            const foundHashes = new Set();
+            const foundPages = new Set();
             
-            // Method 1: Image URLs in HTML
-            const imgPattern = /\/images\/(\d+)-([a-f0-9]+)\.png/gi;
+            // Method 1: Direct image URLs
+            const imgPattern = /\/(\d+)-([a-f0-9]{8,})\.(png|jpg)/gi;
             let match;
             while ((match = imgPattern.exec(html)) !== null) {
                 const pageNum = parseInt(match[1]);
-                if (!foundHashes.has(pageNum)) {
-                    foundHashes.add(pageNum);
+                if (!foundPages.has(pageNum)) {
+                    foundPages.add(pageNum);
                     pages.push({ page: pageNum, hash: match[2] });
                 }
             }
             
-            // Method 2: Look in img tags
+            // Method 2: Full URLs
+            const urlPattern = /https?:\/\/[^"'\s]+\/images\/(\d+)-([a-f0-9]{8,})\./gi;
+            while ((match = urlPattern.exec(html)) !== null) {
+                const pageNum = parseInt(match[1]);
+                if (!foundPages.has(pageNum)) {
+                    foundPages.add(pageNum);
+                    pages.push({ page: pageNum, hash: match[2] });
+                }
+            }
+            
+            // Method 3: img tags
             document.querySelectorAll('img').forEach(img => {
                 const src = img.src || img.dataset?.src || '';
-                const m = src.match(/\/images\/(\d+)-([a-f0-9]+)\./i);
-                if (m && !foundHashes.has(parseInt(m[1]))) {
-                    foundHashes.add(parseInt(m[1]));
+                const m = src.match(/\/(\d+)-([a-f0-9]{8,})\./i);
+                if (m && !foundPages.has(parseInt(m[1]))) {
+                    foundPages.add(parseInt(m[1]));
                     pages.push({ page: parseInt(m[1]), hash: m[2] });
                 }
             });
             
-            // Method 3: Look for page data in JavaScript objects
-            // Scribd stores page data in various places
+            // Method 4: Look for page data in ALL script content
             const scripts = document.querySelectorAll('script');
             scripts.forEach(script => {
                 const content = script.textContent || '';
                 
-                // Pattern: "1":{"hash":"xxx"} or page: {hash: "xxx"}
-                const hashPatterns = [
-                    /"(\d+)":\s*\{[^}]*"hash":\s*"([a-f0-9]+)"/g,
-                    /"pages"\s*:\s*\{[^}]*"(\d+)":\s*\{[^}]*"hash":\s*"([a-f0-9]+)"/g,
-                    /\\"page\\":\s*(\d+),\s*\\"hash\\":\s*\\"([a-f0-9]+)\\"/g
+                // Various patterns for page hashes
+                const patterns = [
+                    /"(\d+)":\s*\{[^}]*"hash":\s*"([a-f0-9]{8,})"/gi,
+                    /"page":\s*(\d+)[^}]*"hash":\s*"([a-f0-9]{8,})"/gi,
+                    /\\"page\\":\s*(\d+)[^}]*\\"hash\\":\s*\\"([a-f0-9]{8,})/gi,
+                    /images\/(\d+)-([a-f0-9]{8,})\./gi
                 ];
                 
-                for (const pattern of hashPatterns) {
+                for (const pattern of patterns) {
                     let m;
                     while ((m = pattern.exec(content)) !== null) {
                         const pageNum = parseInt(m[1]);
-                        if (!foundHashes.has(pageNum) && m[2].length >= 8) {
-                            foundHashes.add(pageNum);
+                        if (!foundPages.has(pageNum)) {
+                            foundPages.add(pageNum);
                             pages.push({ page: pageNum, hash: m[2] });
                         }
                     }
                 }
             });
             
-            // Method 4: Check window object for page data
-            if (window.__INITIAL_STATE__ || window.__PRELOADED_STATE__ || window.pageData) {
-                const state = window.__INITIAL_STATE__ || window.__PRELOADED_STATE__ || window.pageData;
-                if (state && state.pages) {
-                    Object.keys(state.pages).forEach(key => {
-                        const p = state.pages[key];
-                        if (p.hash && !foundHashes.has(parseInt(key))) {
-                            foundHashes.add(parseInt(key));
-                            pages.push({ page: parseInt(key), hash: p.hash });
+            // Method 5: Check for page_urls in window
+            try {
+                // Look for __NEXT_DATA__ or similar
+                const nextData = document.getElementById('__NEXT_DATA__');
+                if (nextData) {
+                    const data = JSON.parse(nextData.textContent);
+                    const findPages = (obj) => {
+                        if (obj && typeof obj === 'object') {
+                            if (obj.page !== undefined && obj.hash) {
+                                const pageNum = parseInt(obj.page);
+                                if (!foundPages.has(pageNum)) {
+                                    foundPages.add(pageNum);
+                                    pages.push({ page: pageNum, hash: obj.hash });
+                                }
+                            }
+                            Object.values(obj).forEach(findPages);
                         }
-                    });
+                        if (Array.isArray(obj)) {
+                            obj.forEach(findPages);
+                        }
+                    };
+                    findPages(data);
                 }
-            }
+            } catch (e) {}
             
-            // Method 5: Look for JSON in data attributes
-            document.querySelectorAll('[data-pages], [data-page-data]').forEach(el => {
-                try {
-                    const data = JSON.parse(el.dataset.pages || el.dataset.pageData || '{}');
-                    Object.keys(data).forEach(key => {
-                        const p = data[key];
-                        if (p.hash && !foundHashes.has(parseInt(key))) {
-                            foundHashes.add(parseInt(key));
-                            pages.push({ page: parseInt(key), hash: p.hash });
-                        }
-                    });
-                } catch (e) {}
+            // Method 6: Extract from background images
+            document.querySelectorAll('[style*="background"]').forEach(el => {
+                const style = el.getAttribute('style') || '';
+                const m = style.match(/url\([^)]*(\d+)-([a-f0-9]{8,})\.[^)]*\)/i);
+                if (m && !foundPages.has(parseInt(m[1]))) {
+                    foundPages.add(parseInt(m[1]));
+                    pages.push({ page: parseInt(m[1]), hash: m[2] });
+                }
             });
             
             return {
@@ -167,15 +190,16 @@ async function extractPages(docId) {
                 debug: {
                     htmlLength: html.length,
                     scriptCount: scripts.length,
-                    imageCount: document.querySelectorAll('img').length
+                    imageCount: document.querySelectorAll('img').length,
+                    foundPages: pages.length
                 }
             };
         });
         
         console.log(`[DATA] Found ${pageData.pages.length} pages, asset: ${pageData.assetId}, total: ${pageData.pageCount}`);
-        console.log(`[DEBUG] HTML length: ${pageData.debug.htmlLength}, scripts: ${pageData.debug.scriptCount}`);
+        console.log(`[DEBUG] HTML: ${pageData.debug.htmlLength}, Scripts: ${pageData.debug.scriptCount}, Images: ${pageData.debug.imageCount}`);
         
-        // If we found pages, construct URLs
+        // Build page objects
         const allPages = new Map();
         if (pageData.assetId) {
             pageData.pages.forEach(p => {
@@ -185,49 +209,6 @@ async function extractPages(docId) {
                     url: `https://html.scribdassets.com/${pageData.assetId}/images/${p.page}-${p.hash}.png`
                 });
             });
-        }
-        
-        // If we still don't have enough pages, try scrolling
-        if (allPages.size < pageData.pageCount && pageData.assetId) {
-            console.log(`[SCROLL] Attempting to load more pages...`);
-            
-            let scrollAttempts = 0;
-            const maxScrolls = 80;
-            
-            while (scrollAttempts < maxScrolls && allPages.size < pageData.pageCount) {
-                await page.evaluate(() => {
-                    window.scrollBy(0, 600);
-                });
-                
-                await new Promise(r => setTimeout(r, 300));
-                
-                // Check for new images
-                const newImages = await page.evaluate(() => {
-                    const found = [];
-                    document.querySelectorAll('img').forEach(img => {
-                        const src = img.src || '';
-                        const m = src.match(/\/images\/(\d+)-([a-f0-9]+)\./i);
-                        if (m) {
-                            found.push({ page: parseInt(m[1]), hash: m[2] });
-                        }
-                    });
-                    return found;
-                });
-                
-                newImages.forEach(p => {
-                    if (!allPages.has(p.page)) {
-                        allPages.set(p.page, {
-                            page: p.page,
-                            hash: p.hash,
-                            url: `https://html.scribdassets.com/${pageData.assetId}/images/${p.page}-${p.hash}.png`
-                        });
-                    }
-                });
-                
-                scrollAttempts++;
-            }
-            
-            console.log(`[SCROLL] Found ${allPages.size} pages after scrolling`);
         }
         
         const pagesArray = Array.from(allPages.values()).sort((a, b) => a.page - b.page);
@@ -261,7 +242,7 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         service: 'scribd-extractor',
-        version: '2.2.0',
+        version: '2.3.0',
         engine: 'Node.js + Puppeteer'
     });
 });
@@ -281,4 +262,4 @@ app.get('/extract', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`🚀 Scribd Extractor v2.2 on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Scribd Extractor v2.3 on port ${PORT}`));
