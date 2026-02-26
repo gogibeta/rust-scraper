@@ -46,62 +46,44 @@ async function extractPages(docId) {
             window.chrome = { runtime: {} };
         });
         
-        // Visit homepage first for cookies
-        console.log('Getting cookies from scribd.com...');
-        await page.goto('https://www.scribd.com/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await new Promise(r => setTimeout(r, 1500));
-        
-        // Try embed URL directly
+        // Go directly to embed URL
         const embedUrl = `https://www.scribd.com/embeds/${docId}/content`;
-        console.log(`Navigating to embed: ${embedUrl}`);
+        console.log(`Navigating to: ${embedUrl}`);
         
-        try {
-            await page.goto(embedUrl, { 
-                waitUntil: 'domcontentloaded',
-                timeout: 30000
-            });
-        } catch (e) {
-            console.log('Embed failed, trying document page...');
-            await page.goto(`https://www.scribd.com/document/${docId}`, { 
-                waitUntil: 'domcontentloaded',
-                timeout: 30000 
-            });
-        }
+        await page.goto(embedUrl, { 
+            waitUntil: 'domcontentloaded',
+            timeout: 45000
+        });
         
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 4000));
         
-        // Check page content
+        // Get page info
         const pageInfo = await page.evaluate(() => {
             const body = document.body;
             const html = body ? body.innerHTML : '';
             const text = body ? body.innerText : '';
             
-            // Find all images
+            // Get all images
             const images = [];
             document.querySelectorAll('img').forEach(img => {
                 const src = img.src || img.dataset?.src || '';
-                if (src) images.push(src);
+                if (src && !images.includes(src)) images.push(src);
             });
             
-            // Find asset ID
+            // Get asset ID
             const assetMatch = html.match(/html\.scribdassets\.com\/([^\/"'\s]+)/);
             
-            // Find page count
+            // Get page count
             const pageMatch = text.match(/(\d+)\s*(?:pages?|slides?)/i);
-            
-            // Check if blocked
-            const isBlocked = html.includes('blocked') || html.includes('not available') || 
-                             html.includes('requires subscription') || html.includes('sign in');
             
             return {
                 title: document.title,
-                images: images.slice(0, 15),
+                images,
                 imageCount: images.length,
                 assetId: assetMatch ? assetMatch[1] : null,
                 pageCount: pageMatch ? parseInt(pageMatch[1]) : 0,
-                isBlocked,
                 url: window.location.href,
-                bodySample: text.substring(0, 500)
+                bodySample: text.substring(0, 300)
             };
         });
         
@@ -111,8 +93,8 @@ async function extractPages(docId) {
         const allPages = new Map();
         
         pageInfo.images.forEach(src => {
-            // Pattern: /images/1-<hash>.png
-            const match = src.match(/\/(\d+)-([a-f0-9]{16,})\./i);
+            // Pattern: /images/1-<hash>.png or /1-<hash>.png
+            let match = src.match(/\/(\d+)-([a-f0-9]{16,})\./i);
             if (match) {
                 allPages.set(parseInt(match[1]), {
                     page: parseInt(match[1]),
@@ -124,9 +106,9 @@ async function extractPages(docId) {
         
         // Scroll to load more
         let scrollAttempts = 0;
-        const maxScrolls = 60;
+        const maxScrolls = 80;
         
-        while (scrollAttempts < maxScrolls && allPages.size < pageInfo.pageCount) {
+        while (scrollAttempts < maxScrolls) {
             const newPages = await page.evaluate(() => {
                 const found = [];
                 document.querySelectorAll('img').forEach(img => {
@@ -169,7 +151,6 @@ async function extractPages(docId) {
                 url: pageInfo.url,
                 imageCount: pageInfo.imageCount,
                 sampleImages: pageInfo.images.slice(0, 5),
-                isBlocked: pageInfo.isBlocked,
                 scrollAttempts
             }
         };
@@ -191,21 +172,17 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         service: 'scribd-extractor',
-        version: '1.4.0',
+        version: '1.5.0',
         engine: 'Node.js + Puppeteer'
     });
 });
 
 app.get('/extract', async (req, res) => {
     const url = req.query.url;
-    if (!url) {
-        return res.status(400).json({ error: 'missing_url' });
-    }
+    if (!url) return res.status(400).json({ error: 'missing_url' });
     
     const docId = extractDocId(url);
-    if (!docId) {
-        return res.status(400).json({ error: 'invalid_url' });
-    }
+    if (!docId) return res.status(400).json({ error: 'invalid_url' });
     
     try {
         const result = await extractPages(docId);
@@ -218,9 +195,7 @@ app.get('/extract', async (req, res) => {
 app.post('/extract', async (req, res) => {
     const { url, save } = req.body;
     const docId = extractDocId(url);
-    if (!docId) {
-        return res.status(400).json({ success: false, error: 'invalid_url' });
-    }
+    if (!docId) return res.status(400).json({ success: false, error: 'invalid_url' });
     
     try {
         const result = await extractPages(docId);
@@ -237,6 +212,4 @@ app.post('/extract', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Scribd Extractor on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Scribd Extractor on port ${PORT}`));
